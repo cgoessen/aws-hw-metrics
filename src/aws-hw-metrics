@@ -1,0 +1,173 @@
+#!/usr/bin/python3
+import psutil
+import socket
+import time
+import os
+import argparse
+import boto3
+import logging
+import json
+
+ap = argparse.ArgumentParser()
+ap.add_argument("-hddtd", type=int, required=False,
+   help="hddtemp daemon port")
+ap.add_argument("-o","--output", required=False,
+   help="output file, used for last output, or to publish without this program")
+ap.add_argument("-hn","--host-name",dest="hostname", required=False,
+   help="hostname, used for metric dimensions")
+ap.add_argument("-last","--last-output", required=False,
+   help="last output file, if provided, generates delta network and disk IO stats")
+ap.add_argument("-ns","--namespace", required=True,
+   help="metrics namespace")
+ap.add_argument('-p','--publish', dest='publish', action='store_true', help="publish the metrics in cloudwatch (using default credentials)")
+ap.set_defaults(publish=False)
+ap.add_argument('-v','--verbose', dest='verbose', action='store_true')
+ap.set_defaults(verbose=False)
+
+args = ap.parse_args()
+
+if args.hostname is not None:
+    hostname = args.hostname
+else:
+    hostname = socket.gethostname()
+
+if args.verbose:
+    log_level = logging.INFO
+else:
+    log_level = logging.WARNING
+logging.basicConfig(filename='/var/log/aws-hw-metrics.log', level=log_level)
+
+previousMetricData = []
+    
+if args.last_output:
+    try:
+        with open(args.last_output) as f:
+            previousMetricData = json.load(f)
+            logging.info("Previous run loaded")
+    except:
+        logging.warning("Could not load previous run") 
+        
+INSTANCE_DIMENSION = {"InstanceId": hostname}
+    
+
+
+def create_metric(name,value,unit='None',dimensions=None):
+    
+    if dimensions is None:
+        _dimensions = INSTANCE_DIMENSION
+    else:
+        _dimensions = {**dimensions,**INSTANCE_DIMENSION}
+    return {"MetricName":name,"Value":value,"Unit":unit,"Dimensions":[ {"Name":k,"Value": v} for k,v in (_dimensions).items()]}
+
+metricData = []
+
+# requires hddtemp daemon to be running e.g hddtemp /dev/sd* -d
+if args.hddtd is not None:
+    hddtemp_d_port = int(args.hddtd) # default port is 7634
+    host = 'localhost'
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((host,hddtemp_d_port))
+        # connection gets closed before data is received
+        time.sleep(0.5)
+        # decode binary and remove extra |
+        raw_hddt_data = s.recv(8192).decode('ascii')[1:-1]
+        hdd_temps = raw_hddt_data.split('||')
+        for hdd_temp in hdd_temps:
+            drive_id,drive_serial,temperature,unit = hdd_temp.split('|')
+            logging.info(f"{drive_id} temp={temperature} {unit}")
+            metricData.append(create_metric("Temperature",int(temperature),dimensions={"DeviceId":drive_id}))
+    except:
+        logging.error("Failed to fetch hdd temperatures") 
+        
+cpu_usage_core = psutil.cpu_percent(interval=None,percpu=True)
+cpu_count = psutil.cpu_count()
+cpu_usage = psutil.cpu_percent(interval=None,percpu=False)
+logging.info(f"cpu {cpu_usage}% cores = {[ str(x)+'%' for x in cpu_usage_core]}")
+metricData.append(create_metric("CPUUtilization",cpu_usage,unit='Percent'))
+for cpuid in range(len(cpu_usage_core)):
+    metricData.append(create_metric("CPUUtilization",cpu_usage_core[cpuid],unit='Percent',dimensions={"CPUId":str(cpuid)}))
+metricData.append(create_metric("CPUCount",cpu_count,unit='Count'))
+
+
+mem = psutil.virtual_memory()
+swap = psutil.swap_memory()
+logging.info(f"mem {mem.percent}% swap {swap.percent}%")
+
+metricData.append(create_metric("MemoryUtilization",mem.percent,unit='Percent'))
+metricData.append(create_metric("MemoryUsed",mem.used,unit='Bytes'))
+metricData.append(create_metric("MemoryAvailable",mem.available,unit='Bytes'))
+metricData.append(create_metric("SwapUtilization",swap.percent,unit='Percent'))
+metricData.append(create_metric("SwapUsed",swap.used,unit='Bytes'))
+metricData.append(create_metric("SwapFree",swap.free,unit='Bytes'))
+
+partitions = psutil.disk_partitions(all=False)
+
+for part in partitions:
+    part_usage = psutil.disk_usage(part.mountpoint)
+    logging.info(f"partition {part.mountpoint} (dev={part.device}) = {part_usage.percent}%")
+    metricData.append(create_metric("DiskUtilization",part_usage.percent,unit='Percent',dimensions={"MountPoint":part.mountpoint}))
+    metricData.append(create_metric("DiskUsed",part_usage.used,unit='Bytes',dimensions={"MountPoint":part.mountpoint}))
+    metricData.append(create_metric("DiskFree",part_usage.free,unit='Bytes',dimensions={"MountPoint":part.mountpoint}))
+
+io = psutil.disk_io_counters(perdisk=True, nowrap=True)
+
+previous_rb = {}
+previous_wb = {}
+previous_netin = {}
+previous_netout = {}
+for m in previousMetricData:
+    if m["MetricName"] ==  "DiskReadBytes" and {"Name":"Type","Value":"aggregate"} in m["Dimensions"] :
+        device = [ d["Value"] for d in m["Dimensions"] if d["Name"] == "DeviceId" ][0]
+        previous_rb[device] = m["Value"]
+    elif m["MetricName"] ==  "DiskWriteBytes" and {"Name":"Type","Value":"aggregate"} in m["Dimensions"] :
+        device = [ d["Value"] for d in m["Dimensions"] if d["Name"] == "DeviceId" ][0]
+        previous_wb[device] = m["Value"]
+    elif m["MetricName"] ==  "NetworkIn" and {"Name":"Type","Value":"aggregate"} in m["Dimensions"] :
+        device = [ d["Value"] for d in m["Dimensions"] if d["Name"] == "NetworkInterface" ][0]
+        previous_netin[device] = m["Value"]
+    elif m["MetricName"] ==  "NetworkOut" and {"Name":"Type","Value":"aggregate"} in m["Dimensions"] :
+        device = [ d["Value"] for d in m["Dimensions"] if d["Name"] == "NetworkInterface" ][0]
+        previous_netout[device] = m["Value"]
+
+for disk in io:
+    logging.info(f"{disk}: read={io[disk].read_bytes} write={io[disk].write_bytes}")
+    metricData.append(create_metric("DiskReadBytes",io[disk].read_bytes,unit='Bytes',dimensions={"DeviceId":disk,"Type":"aggregate"}))
+    metricData.append(create_metric("DiskWriteBytes",io[disk].write_bytes,unit='Bytes',dimensions={"DeviceId":disk,"Type":"aggregate"}))
+    #delta
+    if disk in previous_rb:
+        metricData.append(create_metric("DiskReadBytes",io[disk].read_bytes - previous_rb[disk],unit='Bytes',dimensions={"DeviceId":disk,"Type":"delta"}))
+    if disk in previous_wb:
+        metricData.append(create_metric("DiskWriteBytes",io[disk].write_bytes - previous_wb[disk],unit='Bytes',dimensions={"DeviceId":disk,"Type":"delta"}))
+
+net = psutil.net_io_counters(pernic=True)
+for iface in net:
+    logging.info(f"{iface}: sent: {net[iface].bytes_sent} recieved: {net[iface].bytes_recv}")
+    metricData.append(create_metric("NetworkIn",net[iface].bytes_recv,unit='Bytes',dimensions={"NetworkInterface":iface,"Type":"aggregate"}))
+    metricData.append(create_metric("NetworkOut",net[iface].bytes_sent,unit='Bytes',dimensions={"NetworkInterface":iface,"Type":"aggregate"}))
+    #delta
+    if iface in previous_netin:
+        metricData.append(create_metric("NetworkIn",net[iface].bytes_recv - previous_netin[iface],unit='Bytes',dimensions={"NetworkInterface":iface,"Type":"delta"}))
+    if iface in previous_netout:
+        metricData.append(create_metric("NetworkOut",net[iface].bytes_sent - previous_netout[iface],unit='Bytes',dimensions={"NetworkInterface":iface,"Type":"delta"}))
+    
+temps = psutil.sensors_temperatures(fahrenheit=False)
+
+for trep in temps:
+    for t in temps[trep]:
+        metricData.append(create_metric("Temperature",t.current,dimensions={"SensorId":t.label}))
+
+if args.output:
+    with open(args.output, "w") as f:
+        json.dump(metricData,f,indent=2)
+
+if args.publish:
+    client = boto3.client('cloudwatch')
+    if(len(metricData)<=20):
+        client.put_metric_data(Namespace=args.namespace,MetricData=metricData)
+    else: #CW put metric data only accepts 20 metrics at a time
+        for i in range(0, len(metricData), 20):
+            client.put_metric_data(Namespace=args.namespace,MetricData=metricData[i:i + 20] )
+    
+    
+    
